@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from core.llm_client import LLMClient
+from core.utils import ensure_package_dir, extract_domain_name
 from config.agent_prompts import GENERATOR_PROMPT
 from config.settings import settings
 
@@ -19,9 +20,8 @@ class GeneratorAgent:
         model_name: Optional[str] = None,
     ) -> None:
         self.api_key = api_key or settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model_name = model_name or settings.gemini_model or "gemini-3.8-flash"
+        self.model_name = model_name or settings.gemini_model or "gemini-3.7-flash"
         self.llm_client = LLMClient(api_key=self.api_key, default_model=self.model_name)
-
 
     def _infer_feature_name(self, test_plan: str, default: str = "feature_test") -> str:
         """Infer snake_case feature name from test plan."""
@@ -58,6 +58,7 @@ class GeneratorAgent:
         dom_snapshot: Union[Dict[str, Any], list, str],
         url: str,
         feature_name: Optional[str] = None,
+        domain_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Call Gemini to generate Page Object code and Pytest test code.
 
@@ -66,12 +67,14 @@ class GeneratorAgent:
             dom_snapshot: Pruned accessibility DOM map.
             url: Target application URL.
             feature_name: Optional custom feature name.
+            domain_name: Optional custom domain name (inferred from URL if omitted).
 
         Returns:
             Dictionary containing page_code, test_code, and file paths.
         """
+        resolved_domain = domain_name or extract_domain_name(url)
         resolved_feature = feature_name or self._infer_feature_name(test_plan)
-        page_class_name = "".join(part.capitalize() for part in resolved_feature.split("_")) + "Page"
+        suggested_class_name = "".join(part.capitalize() for part in resolved_feature.split("_")) + "Page"
 
         snapshot_str = (
             json.dumps(dom_snapshot, indent=2)
@@ -81,8 +84,9 @@ class GeneratorAgent:
 
         prompt = GENERATOR_PROMPT.format(
             url=url,
+            domain_name=resolved_domain,
             feature_name=resolved_feature,
-            page_class_name=page_class_name,
+            page_class_name=suggested_class_name,
             test_plan=test_plan,
             dom_snapshot=snapshot_str,
         )
@@ -93,12 +97,51 @@ class GeneratorAgent:
         )
         parsed = self._parse_response(raw_output)
 
-
-        # Standardize expected keys
+        parsed.setdefault("domain_name", resolved_domain)
         parsed.setdefault("feature_name", resolved_feature)
-        parsed.setdefault("page_class_name", page_class_name)
-        parsed.setdefault("page_file_path", f"framework/pages/{resolved_feature}_page.py")
-        parsed.setdefault("test_file_path", f"framework/tests/test_{resolved_feature}.py")
+        parsed.setdefault(
+            "test_file_path",
+            f"framework/tests/{resolved_domain}/test_{resolved_feature}.py",
+        )
+
+        # Handle multi-page generation vs single-page generation
+        pages_list = parsed.get("pages", [])
+        if pages_list and isinstance(pages_list, list):
+            for p in pages_list:
+                p_class = p.get("page_class_name", "")
+                p_file = p.get("page_file_path", "")
+                if not p_file and p_class:
+                    slug = re.sub(r'(?<!^)(?=[A-Z])', '_', p_class).lower()
+                    if not slug.endswith("_page"):
+                        slug = f"{slug}_page"
+                    p["page_file_path"] = f"framework/pages/{resolved_domain}/{slug}.py"
+                elif p_file and f"framework/pages/{resolved_domain}" not in p_file:
+                    file_name = Path(p_file).name
+                    p["page_file_path"] = f"framework/pages/{resolved_domain}/{file_name}"
+
+            # Fallbacks for primary page references
+            primary_file = parsed.get("primary_page_file") or pages_list[-1]["page_file_path"]
+            primary_class = parsed.get("primary_page_class") or pages_list[-1]["page_class_name"]
+            primary_code = pages_list[-1].get("page_code", "")
+
+            parsed.setdefault("page_file_path", primary_file)
+            parsed.setdefault("page_class_name", primary_class)
+            parsed.setdefault("page_code", primary_code)
+        else:
+            # Single logical page object
+            resp_class = parsed.get("page_class_name")
+            if resp_class:
+                slug = re.sub(r'(?<!^)(?=[A-Z])', '_', resp_class).lower()
+                if not slug.endswith("_page"):
+                    slug = f"{slug}_page"
+                default_page_file = f"framework/pages/{resolved_domain}/{slug}.py"
+                parsed.setdefault("page_file_path", default_page_file)
+            else:
+                parsed.setdefault("page_class_name", suggested_class_name)
+                parsed.setdefault(
+                    "page_file_path",
+                    f"framework/pages/{resolved_domain}/{resolved_feature}_page.py",
+                )
 
         return parsed
 
@@ -108,26 +151,36 @@ class GeneratorAgent:
         dom_snapshot: Union[Dict[str, Any], list, str],
         url: str,
         feature_name: Optional[str] = None,
+        domain_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate code and write files to disk under framework/pages and framework/tests.
+        """Generate code and write files to disk under framework/pages/<domain> and framework/tests/<domain>.
 
         Returns:
-            Result dictionary with file paths, codes, and feature name.
+            Result dictionary with file paths, codes, feature name, and domain name.
         """
         generated = self.generate_code(
             test_plan=test_plan,
             dom_snapshot=dom_snapshot,
             url=url,
             feature_name=feature_name,
+            domain_name=domain_name,
         )
 
-        page_path = Path(generated["page_file_path"])
+        # Write all generated page objects (multi-page or single)
+        pages_list = generated.get("pages", [])
+        if pages_list and isinstance(pages_list, list):
+            for p_item in pages_list:
+                p_path = Path(p_item["page_file_path"])
+                ensure_package_dir(p_path.parent)
+                p_path.write_text(p_item.get("page_code", ""), encoding="utf-8")
+        else:
+            page_path = Path(generated["page_file_path"])
+            ensure_package_dir(page_path.parent)
+            page_path.write_text(generated.get("page_code", ""), encoding="utf-8")
+
         test_path = Path(generated["test_file_path"])
-
-        page_path.parent.mkdir(parents=True, exist_ok=True)
-        test_path.parent.mkdir(parents=True, exist_ok=True)
-
-        page_path.write_text(generated["page_code"], encoding="utf-8")
+        ensure_package_dir(test_path.parent)
         test_path.write_text(generated["test_code"], encoding="utf-8")
 
         return generated
+

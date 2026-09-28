@@ -9,39 +9,60 @@ from typing import Any, Dict, Optional
 
 
 class ReporterAgent:
-    """Compiles test reports and produces executive markdown summaries."""
+    """Compiles test reports, serves allure UI, and produces executive markdown summaries."""
 
-    def __init__(self, reports_dir: str = "reports") -> None:
+    def __init__(
+        self,
+        reports_dir: str = "reports",
+        domain: Optional[str] = None,
+        html_report_file: Optional[str | Path] = None,
+    ) -> None:
         self.reports_dir = Path(reports_dir)
-        self.allure_results_dir = self.reports_dir / "allure-results"
-        self.allure_report_dir = self.reports_dir / "allure-report"
-        self.html_report_file = self.reports_dir / "report.html"
-        self.summary_file = self.reports_dir / "executive_summary.md"
+        self.domain = domain
 
-    def compile_allure_report(self) -> Dict[str, Any]:
+        if domain:
+            self.allure_results_dir = self.reports_dir / "allure-results" / domain
+            self.allure_report_dir = self.reports_dir / "allure-report" / domain
+            self.summary_file = self.reports_dir / f"executive_summary_{domain}.md"
+        else:
+            self.allure_results_dir = self.reports_dir / "allure-results"
+            self.allure_report_dir = self.reports_dir / "allure-report"
+            self.summary_file = self.reports_dir / "executive_summary.md"
+
+        if html_report_file:
+            self.html_report_file = Path(html_report_file)
+        else:
+            self.html_report_file = self.reports_dir / "report.html"
+
+    def compile_allure_report(
+        self,
+        domain_results_dir: Optional[str | Path] = None,
+    ) -> Dict[str, Any]:
         """Compile Allure HTML report from raw results if allure CLI is available.
 
         Returns:
             Dict indicating whether compilation was performed and status.
         """
         allure_bin = shutil.which("allure")
+        results_dir = Path(domain_results_dir) if domain_results_dir else self.allure_results_dir
         if not allure_bin:
             return {
                 "compiled": False,
-                "reason": "Allure CLI binary not found in PATH. Raw results saved in reports/allure-results.",
-                "path": str(self.allure_results_dir),
+                "reason": f"Allure CLI binary not found in PATH. Raw results saved in {results_dir}.",
+                "path": str(results_dir),
             }
 
         cmd = [
             allure_bin,
             "generate",
-            str(self.allure_results_dir),
+            str(results_dir),
             "-o",
             str(self.allure_report_dir),
             "--clean",
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            use_shell = sys.platform.startswith("win")
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, shell=use_shell)
             return {
                 "compiled": res.returncode == 0,
                 "path": str(self.allure_report_dir),
@@ -52,6 +73,32 @@ class ReporterAgent:
             return {
                 "compiled": False,
                 "reason": f"Allure report compilation failed: {str(e)}",
+            }
+
+    def serve_allure_report(
+        self,
+        domain_results_dir: Optional[str | Path] = None,
+    ) -> Dict[str, Any]:
+        """Trigger `allure serve <results_dir>` if allure binary is available."""
+        allure_bin = shutil.which("allure")
+        results_dir = Path(domain_results_dir) if domain_results_dir else self.allure_results_dir
+        if not allure_bin:
+            return {
+                "served": False,
+                "reason": "Allure CLI binary not found in PATH.",
+                "path": str(results_dir),
+            }
+
+        cmd = [allure_bin, "serve", str(results_dir)]
+        try:
+            use_shell = sys.platform.startswith("win")
+            subprocess.run(cmd, shell=use_shell)
+            return {"served": True, "path": str(results_dir)}
+        except Exception as e:
+            return {
+                "served": False,
+                "reason": f"Failed to execute allure serve: {str(e)}",
+                "path": str(results_dir),
             }
 
     def generate_summary(self, data: Dict[str, Any]) -> str:
@@ -76,19 +123,21 @@ class ReporterAgent:
             f"**Execution Timestamp:** {now}  ",
             f"**Overall Status:** {status_badge}  ",
             f"**Target URL:** `{data.get('url', 'N/A')}`  ",
+            f"**Target Domain:** `{data.get('domain_name', 'N/A')}`  ",
             f"**User Scenario:** {data.get('scenario', 'N/A')}  ",
             f"**Total Run Attempts:** {data.get('attempts', 1)}  ",
             f"**Healing Iterations Triggered:** {healing_count}",
+
             "",
             "---",
             "",
             "## 📁 Generated Artifacts & Reports",
-            f"- **HTML Test Report:** `{self.html_report_file}`",
-            f"- **Allure Raw Results:** `{self.allure_results_dir}`",
+            f"- **HTML Test Report:** `{data.get('html_report', self.html_report_file)}`",
+            f"- **Allure Raw Results:** `{data.get('allure_results', self.allure_results_dir)}`",
             f"- **Page Object File:** `{data.get('page_file', 'N/A')}`",
             f"- **Pytest Test File:** `{data.get('test_file', 'N/A')}`",
-            f"- **Trace Directory:** `{self.reports_dir / 'traces'}`",
-            f"- **Screenshots Directory:** `{self.reports_dir / 'screenshots'}`",
+            f"- **Trace Directory:** `{self.reports_dir / 'traces' / (data.get('domain_name') or self.domain or '')}`",
+            f"- **Screenshots Directory:** `{self.reports_dir / 'screenshots' / (data.get('domain_name') or self.domain or '')}`",
             "",
             "---",
             "",

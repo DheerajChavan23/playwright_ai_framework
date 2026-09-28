@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import os
+import shutil
 import sys
 from datetime import datetime
 
@@ -28,7 +29,13 @@ console = Console(force_terminal=True, legacy_windows=False)
 
 
 
-def render_banner(url: str, scenario: str, model: str) -> None:
+def render_banner(
+    url: str,
+    scenario: str,
+    model: str,
+    headed: bool = False,
+    slowmo: int = 0,
+) -> None:
     """Print an aesthetic Rich header panel."""
     banner_text = Text()
     banner_text.append("🤖 Autonomous Self-Healing E2E Test Automation\n", style="bold cyan")
@@ -36,6 +43,8 @@ def render_banner(url: str, scenario: str, model: str) -> None:
     banner_text.append(f"🌐 Target URL: {url}\n", style="bold yellow")
     banner_text.append(f"🎯 Scenario:   {scenario}\n", style="white")
     banner_text.append(f"🧠 Model:      {model}\n", style="dim green")
+    mode_str = f"Headed (slowmo: {slowmo}ms)" if headed else "Headless"
+    banner_text.append(f"🖥️ Mode:       {mode_str}\n", style="bold magenta" if headed else "dim cyan")
     banner_text.append(f"🕒 Timestamp:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
 
     console.print(Panel(banner_text, border_style="cyan", expand=False))
@@ -78,16 +87,22 @@ async def main_async() -> int:
         help="Gemini model override (default from config/settings)",
     )
     parser.add_argument(
-        "--headless",
+        "--headed",
         action="store_true",
-        default=None,
-        help="Run browser in headless mode (default: True)",
+        default=False,
+        help="Launch the visible browser window (default: headless)",
     )
     parser.add_argument(
-        "--no-headless",
-        action="store_false",
-        dest="headless",
-        help="Run browser with visible UI window",
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Explicitly run browser in headless mode (default behavior)",
+    )
+    parser.add_argument(
+        "--slowmo",
+        type=int,
+        default=0,
+        help="Delay between Playwright actions in milliseconds (e.g., 300 to 500 ms)",
     )
     parser.add_argument(
         "--max-healing",
@@ -96,10 +111,20 @@ async def main_async() -> int:
         help="Maximum self-healing retry iterations (default: 3)",
     )
 
+    parser.add_argument(
+        "--serve-report",
+        action="store_true",
+        default=False,
+        help="Automatically trigger 'allure serve' for generated results if Allure CLI is installed",
+    )
+
     args = parser.parse_args()
 
-    active_model = args.model or settings.gemini_model or "gemini-2.5-flash"
-    render_banner(args.url, args.scenario, active_model)
+    # Headless is default unless --headed is explicitly specified
+    is_headed = args.headed and not args.headless
+
+    active_model = args.model or settings.gemini_model or "gemini-3.7-flash"
+    render_banner(args.url, args.scenario, active_model, headed=is_headed, slowmo=args.slowmo)
 
     events = []
 
@@ -111,9 +136,11 @@ async def main_async() -> int:
 
     orchestrator = AutomationOrchestrator(
         model_name=args.model,
-        headless=args.headless,
+        headed=is_headed,
+        slowmo=args.slowmo,
         max_healing_attempts=args.max_healing,
     )
+
 
     console.print("\n[bold cyan]Starting Autonomous Execution Pipeline...[/bold cyan]\n")
 
@@ -163,6 +190,26 @@ async def main_async() -> int:
 
     console.print("\n")
     console.print(Panel(summary_text, title="Final Execution Report", border_style=border_col))
+
+    # Trigger allure serve if requested
+    if args.serve_report:
+        allure_bin = shutil.which("allure")
+        allure_dir = run_data.get("allure_results") or f"reports/allure-results/{run_data.get('domain_name', '')}"
+        if not allure_bin:
+            console.print(
+                f"\n[bold yellow]⚠️  Allure CLI ('allure') is not installed or not found in system PATH.[/bold yellow]\n"
+                f"[dim]Skipping 'allure serve'. To view Allure reports interactively, install Allure CLI "
+                f"(e.g. via Scoop: 'scoop install allure' or npm: 'npm install -g allure-commandline').[/dim]\n"
+                f"[dim]Domain results stored in: [bold cyan]{allure_dir}[/bold cyan][/dim]\n"
+            )
+        else:
+            console.print(f"\n[bold cyan]🚀 Serving Allure test report from {allure_dir}...[/bold cyan]")
+            try:
+                orchestrator.serve_report(run_data)
+            except KeyboardInterrupt:
+                console.print("\n[dim]Allure server closed.[/dim]")
+            except Exception as e:
+                console.print(f"\n[bold red]Error launching allure serve:[/bold red] {e}")
 
     return 0 if success else 1
 

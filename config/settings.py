@@ -8,8 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings loaded from environment or .env file."""
 
-    gemini_api_key: str = "Your_Gemini_API_Key"
-    gemini_model: str = "gemini-3.7-flash"
+    gemini_api_key: str = "[ENCRYPTION_KEY]"
+    gemini_model: str = "gemini-2.5-flash"
     default_headless: bool = True
 
     max_healing_attempts: int = 3

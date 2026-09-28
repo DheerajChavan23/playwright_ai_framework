@@ -23,6 +23,17 @@ class HealerAgent:
         self.llm_client = LLMClient(api_key=self.api_key, default_model=self.model_name)
 
 
+    def _extract_failing_page_path(self, error_logs: str, test_file_path: str = "") -> Optional[str]:
+        """Extract the exact failing Page Object file from pytest traceback logs."""
+        if not error_logs:
+            return None
+        matches = re.findall(r"(framework[/\\]pages[/\\][a-zA-Z0-9_/\\]+\.py)", error_logs)
+        for m in reversed(matches):  # Innermost stack frame first
+            norm = Path(m.replace("\\", "/"))
+            if norm.exists():
+                return str(norm)
+        return None
+
     def _infer_page_path(self, test_file_path: str) -> str:
         """Infer corresponding page object path from test file path."""
         p = Path(test_file_path)
@@ -32,8 +43,25 @@ class HealerAgent:
         else:
             feature_name = stem
 
-        page_file = Path("framework/pages") / f"{feature_name}_page.py"
-        return str(page_file)
+        # Check if test file is in a domain subdirectory (e.g., framework/tests/<domain>/test_*.py)
+        domain_sub = p.parent.name
+        if domain_sub and domain_sub not in ("tests", "."):
+            domain_page = Path("framework/pages") / domain_sub / f"{feature_name}_page.py"
+            if domain_page.exists() or not (Path("framework/pages") / f"{feature_name}_page.py").exists():
+                return str(domain_page)
+
+        # Fallback to root pages directory or search
+        flat_page = Path("framework/pages") / f"{feature_name}_page.py"
+        if flat_page.exists():
+            return str(flat_page)
+
+        # Search for any matching page file across domain subdirectories
+        matches = list(Path("framework/pages").glob(f"**/{feature_name}_page.py"))
+        if matches:
+            return str(matches[0])
+
+        return str(Path("framework/pages") / f"{feature_name}_page.py")
+
 
     def _parse_response(self, raw_text: str) -> Dict[str, Any]:
         """Extract and parse JSON payload from Healer Agent response."""
@@ -71,7 +99,8 @@ class HealerAgent:
             Dictionary containing diagnosis, fix_type, patched_file, and updated code.
         """
         test_path = Path(test_file_path)
-        resolved_page_path = Path(page_file_path or self._infer_page_path(test_file_path))
+        failing_page = self._extract_failing_page_path(error_logs, test_file_path)
+        resolved_page_path = Path(failing_page or page_file_path or self._infer_page_path(test_file_path))
 
         test_code = test_path.read_text(encoding="utf-8") if test_path.exists() else ""
         page_code = (

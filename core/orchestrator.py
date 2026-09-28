@@ -1,6 +1,8 @@
 """End-to-End Autonomous Automation Orchestrator."""
 
 import asyncio
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from agents.generator import GeneratorAgent
 from agents.healer import HealerAgent
@@ -9,6 +11,7 @@ from agents.reporter import ReporterAgent
 from config.settings import settings
 from core.browser_manager import BrowserManager
 from core.test_runner import TestRunner
+from core.utils import extract_domain_name
 
 
 class AutomationOrchestrator:
@@ -19,13 +22,24 @@ class AutomationOrchestrator:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         headless: Optional[bool] = None,
+        headed: bool = False,
+        slowmo: int = 0,
         max_healing_attempts: Optional[int] = None,
     ) -> None:
         self.api_key = api_key or settings.gemini_api_key
         self.model_name = model_name or settings.gemini_model
-        self.headless = (
-            headless if headless is not None else settings.default_headless
-        )
+
+        if headed:
+            self.headed = True
+            self.headless = False
+        elif headless is not None:
+            self.headless = headless
+            self.headed = not headless
+        else:
+            self.headless = settings.default_headless
+            self.headed = not self.headless
+
+        self.slowmo = slowmo or 0
         self.max_healing_attempts = (
             max_healing_attempts
             if max_healing_attempts is not None
@@ -33,11 +47,12 @@ class AutomationOrchestrator:
         )
 
         self.browser_manager = BrowserManager(headless=self.headless)
-        self.test_runner = TestRunner()
+        self.test_runner = TestRunner(headed=self.headed, slowmo=self.slowmo)
         self.planner = PlannerAgent(api_key=self.api_key, model_name=self.model_name)
         self.generator = GeneratorAgent(api_key=self.api_key, model_name=self.model_name)
         self.healer = HealerAgent(api_key=self.api_key, model_name=self.model_name)
         self.reporter = ReporterAgent()
+
 
     async def run(
         self,
@@ -61,35 +76,50 @@ class AutomationOrchestrator:
 
         # 1. DOM Reconnaissance
         notify("DOM Reconnaissance", "RUNNING", f"Navigating to {url}")
-        dom_snapshot = await self.browser_manager.inspect_page(url)
+        dom_snapshot = await self.browser_manager.inspect_page(url, scenario=scenario)
         elements_count = len(dom_snapshot.get("interactive_elements", []))
-        notify(
-            "DOM Reconnaissance",
-            "COMPLETED",
-            f"Extracted {elements_count} interactive elements from '{dom_snapshot.get('title', '')}'",
-        )
+        screens = dom_snapshot.get("screens", [])
+        if len(screens) > 1:
+            details_str = f"Multi-step exploration: captured {len(screens)} screens ({', '.join(s['screen_name'] for s in screens)})"
+        else:
+            details_str = f"Extracted {elements_count} interactive elements from '{dom_snapshot.get('title', '')}'"
+        notify("DOM Reconnaissance", "COMPLETED", details_str)
 
         # 2. Test Planning
         notify("Test Planner", "RUNNING", "Formulating BDD test plan with Gemini")
         test_plan = self.planner.plan_test(url, scenario, dom_snapshot)
         feature_name = self.planner.extract_feature_name(test_plan)
-        notify("Test Planner", "COMPLETED", f"Generated BDD plan for feature '{feature_name}'")
+        domain_name = extract_domain_name(url)
+        notify("Test Planner", "COMPLETED", f"Generated BDD plan for feature '{feature_name}' (domain: '{domain_name}')")
 
-        # 3. Code Generation (Page Object & Pytest Suite)
-        notify("Code Generator", "RUNNING", "Synthesizing Page Object Model and Pytest suite")
+        # 3. Code Generation (Domain-specific Page Object & Pytest Suite)
+        notify("Code Generator", "RUNNING", f"Synthesizing POM & Pytest suite in '{domain_name}' subdirectories")
         gen_result = self.generator.generate_and_save(
             test_plan=test_plan,
             dom_snapshot=dom_snapshot,
             url=url,
             feature_name=feature_name,
+            domain_name=domain_name,
         )
         page_file = gen_result["page_file_path"]
         test_file = gen_result["test_file_path"]
         notify("Code Generator", "COMPLETED", f"Created {page_file} and {test_file}")
 
+        # Domain-segregated report storage
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        html_report_file = Path("reports") / f"report_{domain_name}_{timestamp}.html"
+        allure_results_dir = Path("reports") / "allure-results" / domain_name
+        html_report_file.parent.mkdir(parents=True, exist_ok=True)
+        allure_results_dir.mkdir(parents=True, exist_ok=True)
+
         # 4. Initial Test Execution
         notify("Subprocess Test Runner", "RUNNING", f"Executing {test_file}")
-        test_result = self.test_runner.run_test(test_file)
+        test_result = self.test_runner.run_test(
+            test_file,
+            domain=domain_name,
+            html_report_path=html_report_file,
+            allure_results_dir=allure_results_dir,
+        )
         attempts = 1
         healing_history: List[Dict[str, Any]] = []
 
@@ -112,7 +142,7 @@ class AutomationOrchestrator:
 
             # Re-inspect DOM if necessary for updated state
             try:
-                updated_dom = await self.browser_manager.inspect_page(url)
+                updated_dom = await self.browser_manager.inspect_page(url, scenario=scenario)
             except Exception:
                 updated_dom = dom_snapshot
 
@@ -139,8 +169,14 @@ class AutomationOrchestrator:
 
             # Re-run test suite
             notify("Subprocess Test Runner", "RE-TESTING", f"Re-executing {test_file}")
-            test_result = self.test_runner.run_test(test_file)
+            test_result = self.test_runner.run_test(
+                test_file,
+                domain=domain_name,
+                html_report_path=html_report_file,
+                allure_results_dir=allure_results_dir,
+            )
             attempts += 1
+
 
             if test_result["success"]:
                 notify("Self-Healer Agent", "SUCCESS", "Healed test suite passed successfully")
@@ -154,7 +190,8 @@ class AutomationOrchestrator:
 
         # 6. Reporting Pipeline
         notify("Reporting Pipeline", "RUNNING", "Compiling HTML and Allure test reports")
-        allure_compile_status = self.reporter.compile_allure_report()
+        reporter = ReporterAgent(domain=domain_name, html_report_file=html_report_file)
+        allure_compile_status = reporter.compile_allure_report(domain_results_dir=allure_results_dir)
 
         run_data = {
             "success": test_result["success"],
@@ -162,6 +199,7 @@ class AutomationOrchestrator:
             "healing_history": healing_history,
             "url": url,
             "scenario": scenario,
+            "domain_name": domain_name,
             "test_plan": test_plan,
             "feature_name": feature_name,
             "page_file": page_file,
@@ -169,15 +207,24 @@ class AutomationOrchestrator:
             "test_result": test_result,
             "failure_reason": test_result.get("failure_reason", ""),
             "allure_compile": allure_compile_status,
+            "html_report": str(html_report_file),
+            "allure_results": str(allure_results_dir),
+            "traces_dir": str(Path("reports/traces") / domain_name),
+            "screenshots_dir": str(Path("reports/screenshots") / domain_name),
         }
 
-        summary_md = self.reporter.generate_summary(run_data)
+        summary_md = reporter.generate_summary(run_data)
         run_data["summary_markdown"] = summary_md
-        run_data["summary_file"] = str(self.reporter.summary_file)
-        run_data["html_report"] = str(self.reporter.html_report_file)
-        run_data["allure_results"] = str(self.reporter.allure_results_dir)
+        run_data["summary_file"] = str(reporter.summary_file)
 
         overall_status = "PASSED" if test_result["success"] else "FAILED"
         notify("Reporting Pipeline", overall_status, f"Final result: {overall_status}")
 
         return run_data
+
+    def serve_report(self, run_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Trigger allure serve for the generated domain results directory."""
+        domain = run_data.get("domain_name")
+        allure_dir = run_data.get("allure_results") or (Path("reports/allure-results") / (domain or ""))
+        reporter = ReporterAgent(domain=domain)
+        return reporter.serve_allure_report(allure_dir)
